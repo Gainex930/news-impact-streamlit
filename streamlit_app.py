@@ -5,6 +5,7 @@ import html
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -25,6 +26,10 @@ CN_TZ = timezone(timedelta(hours=8))
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+SINA_MARKET_HEADERS = {
+    "Referer": "https://finance.sina.com.cn/",
+    "Accept": "*/*",
 }
 
 
@@ -500,12 +505,181 @@ def load_news(limit: int = 260) -> tuple[list[dict[str, Any]], list[dict[str, An
     return diversify(items)[:limit], health, now_iso()
 
 
+def finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None
+
+
+def format_count(value: Any) -> str:
+    number = finite_number(value)
+    return f"{int(number):,}" if number is not None else "--"
+
+
+def format_percent(value: Any) -> str:
+    number = finite_number(value)
+    if number is None:
+        return "--"
+    return f"{'+' if number > 0 else ''}{number:.2f}%"
+
+
+def market_tone(value: Any) -> str:
+    number = finite_number(value)
+    if number is None or number == 0:
+        return "flat"
+    return "up" if number > 0 else "down"
+
+
+def fetch_market_indices() -> list[dict[str, Any]]:
+    endpoint = (
+        "https://push2.eastmoney.com/api/qt/ulist.np/get"
+        "?fltt=2&secids=1.000001,0.399001,0.399006,90.BK1137,90.BK0891,90.BK0917"
+        "&fields=f12,f14,f2,f3,f4,f6"
+    )
+    payload = requests.get(endpoint, headers=REQUEST_HEADERS, timeout=10).json()
+    return [
+        {
+            "code": row.get("f12", ""),
+            "name": row.get("f14", ""),
+            "price": row.get("f2", "--"),
+            "change": row.get("f3"),
+            "amount": row.get("f6"),
+        }
+        for row in payload.get("data", {}).get("diff", [])
+        if row.get("f14")
+    ]
+
+
+def fetch_sina_industry_sectors() -> dict[str, list[dict[str, Any]]]:
+    text = fetch_text(
+        "https://vip.stock.finance.sina.com.cn/q/view/newFLJK.php?param=industry",
+        encoding="gbk",
+        headers=SINA_MARKET_HEADERS,
+    )
+    match = re.search(r"=\s*(\{[\s\S]*\})\s*;?\s*$", text)
+    if not match:
+        raise ValueError("行业板块数据格式异常")
+    payload = json.loads(match.group(1))
+    rows = []
+    for value in payload.values():
+        parts = str(value).split(",")
+        change = finite_number(parts[5] if len(parts) > 5 else None)
+        if len(parts) < 2 or change is None:
+            continue
+        rows.append(
+            {
+                "code": parts[0],
+                "name": parts[1],
+                "stock_count": int(finite_number(parts[2] if len(parts) > 2 else 0) or 0),
+                "change": change,
+                "amount": finite_number(parts[7] if len(parts) > 7 else 0) or 0,
+                "lead_stock": parts[12] if len(parts) > 12 else "",
+            }
+        )
+    return {
+        "up": sorted(rows, key=lambda row: row["change"], reverse=True)[:3],
+        "down": sorted(rows, key=lambda row: row["change"])[:3],
+    }
+
+
+def fetch_sina_stock_count() -> int:
+    text = fetch_text(
+        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeStockCount?node=hs_a",
+        encoding="gbk",
+        headers=SINA_MARKET_HEADERS,
+    )
+    match = re.search(r"\d+", text)
+    return int(match.group(0)) if match else 0
+
+
+def fetch_sina_stock_page(page: int) -> list[dict[str, Any]]:
+    url = (
+        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"Market_Center.getHQNodeData?page={page}&num=100&sort=symbol&asc=1&node=hs_a&symbol=&_s_r_a=page"
+    )
+    text = fetch_text(url, encoding="gbk", headers=SINA_MARKET_HEADERS)
+    rows = json.loads(text.strip() or "[]")
+    return rows if isinstance(rows, list) else []
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_market_breadth() -> dict[str, Any]:
+    total = fetch_sina_stock_count()
+    pages = max(0, (total + 99) // 100)
+    up = down = flat = counted = failed_pages = 0
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_sina_stock_page, page): page for page in range(1, pages + 1)}
+        for future in as_completed(futures):
+            try:
+                rows = future.result()
+            except Exception:
+                failed_pages += 1
+                continue
+            for row in rows:
+                change = finite_number(row.get("changepercent"))
+                if change is None:
+                    continue
+                counted += 1
+                if change > 0:
+                    up += 1
+                elif change < 0:
+                    down += 1
+                else:
+                    flat += 1
+    return {
+        "up": up,
+        "down": down,
+        "flat": flat,
+        "total": total or counted,
+        "counted": counted,
+        "partial": failed_pages > 0,
+        "fetched_at": now_iso(),
+    }
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_market_snapshot() -> dict[str, Any]:
+    try:
+        indices = fetch_market_indices()
+    except Exception:
+        indices = []
+    try:
+        sectors = fetch_sina_industry_sectors()
+    except Exception:
+        sectors = {"up": [], "down": []}
+    try:
+        breadth = load_market_breadth()
+    except Exception:
+        breadth = {}
+    return {"items": indices, "sectors": sectors, "breadth": breadth}
+
+
 def inject_css() -> None:
     st.markdown(
         """
         <style>
         .block-container { padding-top: 1.2rem; max-width: 1400px; }
         .metric-card { padding: 14px 16px; border: 1px solid #d9e2ef; border-radius: 8px; background: #fff; }
+        .market-overview { margin: 0.35rem 0 0.15rem; padding: 7px 10px; border: 1px solid #d9e2ef; border-radius: 8px; background: #fff; box-shadow: 0 8px 22px rgba(20, 32, 51, 0.05); }
+        .market-line { display: flex; align-items: center; gap: 7px; min-height: 24px; overflow: hidden; white-space: nowrap; }
+        .market-line + .market-line { margin-top: 4px; }
+        .market-label, .market-muted { color: #5d697c; font-size: 0.78rem; font-weight: 700; }
+        .market-muted { color: #8a96a8; font-weight: 600; }
+        .market-divider { width: 1px; align-self: stretch; min-height: 18px; background: #d9e2ef; }
+        .market-indexes, .sector-group { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
+        .market-indexes { flex: 1 1 auto; }
+        .sector-group { flex: 1 1 0; }
+        .market-pill, .breadth-pill { display: inline-flex; align-items: baseline; gap: 5px; max-width: 100%; min-height: 22px; padding: 2px 7px; border: 1px solid #d9e2ef; border-radius: 999px; background: #f9fbff; font-size: 0.78rem; line-height: 1.15; font-variant-numeric: tabular-nums; }
+        .breadth-pill { font-weight: 800; }
+        .index-pill strong { font-size: 0.82rem; }
+        .market-index-name, .market-sector-name { min-width: 0; overflow: hidden; color: #142033; font-weight: 700; text-overflow: ellipsis; }
+        .market-index-name { max-width: 4.8rem; }
+        .market-sector-name { max-width: 6.4rem; }
+        .up { color: #b91c1c; }
+        .down { color: #047857; }
+        .flat { color: #5d697c; }
         .news-card { display: grid; grid-template-columns: 58px 1fr; gap: 14px; padding: 14px; border: 1px solid #d9e2ef; border-radius: 8px; background: #fff; margin-bottom: 10px; }
         .score { width: 50px; height: 50px; border-radius: 50%; display: grid; place-items: center; font-weight: 800; color: #0f2d5c; background: conic-gradient(#2563eb calc(var(--s) * 1%), #e5edf8 0); }
         .title { font-size: 1.02rem; font-weight: 800; color: #082044; margin-bottom: 4px; }
@@ -516,6 +690,11 @@ def inject_css() -> None:
         .tag.bad { border-color: #bdebdc; color: #047857; background: #eefcf7; }
         .health-ok { color: #047857; font-weight: 700; }
         .health-bad { color: #b91c1c; font-weight: 700; }
+        @media (max-width: 760px) {
+          .market-line { flex-wrap: wrap; white-space: normal; overflow: visible; }
+          .market-divider { display: none; }
+          .market-indexes, .sector-group { flex-wrap: wrap; overflow: visible; }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -542,6 +721,66 @@ def format_time(value: str) -> str:
         return dt.strftime("%m/%d %H:%M:%S")
     except Exception:
         return "--"
+
+
+def render_market_overview(snapshot: dict[str, Any]) -> None:
+    items = snapshot.get("items") or []
+    sectors = snapshot.get("sectors") or {"up": [], "down": []}
+    breadth = snapshot.get("breadth") or {}
+
+    index_html = []
+    for item in items[:3]:
+        change = item.get("change")
+        index_html.append(
+            f"""
+            <span class="market-pill index-pill" title="{html.escape(str(item.get("name", "")))}">
+              <span class="market-index-name">{html.escape(str(item.get("name", "")))}</span>
+              <strong>{html.escape(str(item.get("price", "--")))}</strong>
+              <em class="{market_tone(change)}">{format_percent(change)}</em>
+            </span>
+            """
+        )
+    if not index_html:
+        index_html.append('<span class="market-muted">指数暂无</span>')
+
+    def sector_html(rows: list[dict[str, Any]], empty: str) -> str:
+        if not rows:
+            return f'<span class="market-muted">{empty}</span>'
+        return "".join(
+            f"""
+            <span class="market-pill sector-pill" title="{html.escape(str(row.get("lead_stock", "")))}">
+              <span class="market-sector-name">{html.escape(str(row.get("name", "")))}</span>
+              <em class="{market_tone(row.get("change"))}">{format_percent(row.get("change"))}</em>
+            </span>
+            """
+            for row in rows
+        )
+
+    stale = '<span class="market-muted">部分</span>' if breadth.get("partial") else ""
+    st.markdown(
+        f"""
+        <div class="market-overview">
+          <div class="market-line">
+            <span class="market-label">市场宽度</span>
+            <span class="breadth-pill up">涨 {format_count(breadth.get("up"))}</span>
+            <span class="breadth-pill down">跌 {format_count(breadth.get("down"))}</span>
+            <span class="breadth-pill flat">平 {format_count(breadth.get("flat"))}</span>
+            <span class="market-muted">全A {format_count(breadth.get("total"))}</span>
+            {stale}
+            <span class="market-divider"></span>
+            <span class="market-indexes">{''.join(index_html)}</span>
+          </div>
+          <div class="market-line">
+            <span class="market-label">领涨前三</span>
+            <span class="sector-group">{sector_html(sectors.get("up", []), "暂无")}</span>
+            <span class="market-divider"></span>
+            <span class="market-label">领跌前三</span>
+            <span class="sector-group">{sector_html(sectors.get("down", []), "暂无")}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def render_item(item: dict[str, Any]) -> None:
@@ -599,6 +838,7 @@ def main() -> None:
         direction_filter = st.selectbox("方向", ["全部", "利好", "利空", "多空混合", "中性"])
 
     items, health, fetched_at = load_news(260)
+    market_snapshot = load_market_snapshot()
     source_options = ["全部"] + sorted({item["source"] for item in items})
     with st.sidebar:
         source_filter = st.selectbox("来源", source_options)
@@ -631,6 +871,7 @@ def main() -> None:
     c2.metric("资讯", len(items))
     c3.metric("高影响", high_count)
     c4.metric("小作文", rumor_count)
+    render_market_overview(market_snapshot)
     st.caption(f"最后更新：{format_time(fetched_at)}")
 
     tab_feed, tab_watch, tab_sources, tab_rumor = st.tabs(["多源资讯流", "重点盯盘", "来源状态", "手动小作文"])
