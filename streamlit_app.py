@@ -723,6 +723,13 @@ def format_time(value: str) -> str:
         return "--"
 
 
+def render_html(markup: str) -> None:
+    if hasattr(st, "html"):
+        st.html(markup)
+    else:
+        st.markdown(markup, unsafe_allow_html=True)
+
+
 def render_market_overview(snapshot: dict[str, Any]) -> None:
     items = snapshot.get("items") or []
     sectors = snapshot.get("sectors") or {"up": [], "down": []}
@@ -732,13 +739,11 @@ def render_market_overview(snapshot: dict[str, Any]) -> None:
     for item in items[:3]:
         change = item.get("change")
         index_html.append(
-            f"""
-            <span class="market-pill index-pill" title="{html.escape(str(item.get("name", "")))}">
-              <span class="market-index-name">{html.escape(str(item.get("name", "")))}</span>
-              <strong>{html.escape(str(item.get("price", "--")))}</strong>
-              <em class="{market_tone(change)}">{format_percent(change)}</em>
-            </span>
-            """
+            f'<span class="market-pill index-pill" title="{html.escape(str(item.get("name", "")))}">'
+            f'<span class="market-index-name">{html.escape(str(item.get("name", "")))}</span>'
+            f'<strong>{html.escape(str(item.get("price", "--")))}</strong>'
+            f'<em class="{market_tone(change)}">{format_percent(change)}</em>'
+            "</span>"
         )
     if not index_html:
         index_html.append('<span class="market-muted">指数暂无</span>')
@@ -747,40 +752,36 @@ def render_market_overview(snapshot: dict[str, Any]) -> None:
         if not rows:
             return f'<span class="market-muted">{empty}</span>'
         return "".join(
-            f"""
-            <span class="market-pill sector-pill" title="{html.escape(str(row.get("lead_stock", "")))}">
-              <span class="market-sector-name">{html.escape(str(row.get("name", "")))}</span>
-              <em class="{market_tone(row.get("change"))}">{format_percent(row.get("change"))}</em>
-            </span>
-            """
+            f'<span class="market-pill sector-pill" title="{html.escape(str(row.get("lead_stock", "")))}">'
+            f'<span class="market-sector-name">{html.escape(str(row.get("name", "")))}</span>'
+            f'<em class="{market_tone(row.get("change"))}">{format_percent(row.get("change"))}</em>'
+            "</span>"
             for row in rows
         )
 
     stale = '<span class="market-muted">部分</span>' if breadth.get("partial") else ""
-    st.markdown(
-        f"""
-        <div class="market-overview">
-          <div class="market-line">
-            <span class="market-label">市场宽度</span>
-            <span class="breadth-pill up">涨 {format_count(breadth.get("up"))}</span>
-            <span class="breadth-pill down">跌 {format_count(breadth.get("down"))}</span>
-            <span class="breadth-pill flat">平 {format_count(breadth.get("flat"))}</span>
-            <span class="market-muted">全A {format_count(breadth.get("total"))}</span>
-            {stale}
-            <span class="market-divider"></span>
-            <span class="market-indexes">{''.join(index_html)}</span>
-          </div>
-          <div class="market-line">
-            <span class="market-label">领涨前三</span>
-            <span class="sector-group">{sector_html(sectors.get("up", []), "暂无")}</span>
-            <span class="market-divider"></span>
-            <span class="market-label">领跌前三</span>
-            <span class="sector-group">{sector_html(sectors.get("down", []), "暂无")}</span>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    market_html = (
+        '<div class="market-overview">'
+        '<div class="market-line">'
+        '<span class="market-label">市场宽度</span>'
+        f'<span class="breadth-pill up">涨 {format_count(breadth.get("up"))}</span>'
+        f'<span class="breadth-pill down">跌 {format_count(breadth.get("down"))}</span>'
+        f'<span class="breadth-pill flat">平 {format_count(breadth.get("flat"))}</span>'
+        f'<span class="market-muted">全A {format_count(breadth.get("total"))}</span>'
+        f'{stale}'
+        '<span class="market-divider"></span>'
+        f'<span class="market-indexes">{"".join(index_html)}</span>'
+        '</div>'
+        '<div class="market-line">'
+        '<span class="market-label">领涨前三</span>'
+        f'<span class="sector-group">{sector_html(sectors.get("up", []), "暂无")}</span>'
+        '<span class="market-divider"></span>'
+        '<span class="market-label">领跌前三</span>'
+        f'<span class="sector-group">{sector_html(sectors.get("down", []), "暂无")}</span>'
+        '</div>'
+        '</div>'
     )
+    render_html(market_html)
 
 
 def render_item(item: dict[str, Any]) -> None:
